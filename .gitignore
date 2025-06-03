@@ -1,0 +1,10 @@
+BasicTS_Data/
+torch_models/
+__pycache__/
+env/
+.DS_Store
+# ignore folders ending with models/
+*_models/
+**/*_models/
+**/*results*/
+
