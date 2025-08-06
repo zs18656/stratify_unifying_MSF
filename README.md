@@ -3,7 +3,7 @@
 
 Welcome to the official codebase for **Stratify** — our paper is under review exploring a unified framework for multi-step time series forecasting strategies. Stratify bridges decades of forecasting literature, generalises existing methods, and discovers **novel, higher-performing strategies** — all in one cohesive parameterised space. 🧠📊
 
-🔗 **[Read the paper on arXiv](https://arxiv.org/pdf/2412.20510?)**  
+🔗 **[Read the paper (ECML 2025)](https://doi.org/10.1007/s10618-025-01135-1)**  
 📂 **[BasicTS Benchmark Repository](https://github.com/GestaltCogTeam/BasicTS.git)**  
 
 ---
