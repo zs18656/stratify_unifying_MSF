@@ -55,12 +55,13 @@ Our full experiments span:
 If you find this framework useful, please consider citing our paper:
 
 ```bibtex
-@article{green2024stratify,
-  title={Stratify: Unifying Multi-Step Forecasting Strategies},
-  author={Green, Riku and Stevens, Grant and Abdallah, Zahraa and Silva Filho, Telmo M.},
-  journal={arXiv preprint arXiv:2412.20510},
-  year={2024}
-}
+@article{green2025stratify, title = {Stratify: unifying multi-step forecasting strategies},
+volume = {39}, issn = {1573-756X}, shorttitle = {Stratify},
+doi = {10.1007/s10618-025-01135-1}, number = {5},
+journal = {Data Mining and Knowledge Discovery},
+author = {Green, Riku and Stevens, Grant and Abdallah, Zahraa S. and Silva Filho, Telmo M.},
+month = aug, year = {2025}, pages = {64}}
+
 ```
 
 ---
