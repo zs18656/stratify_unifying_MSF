@@ -1,3 +1,4 @@
+# strategies.py
 from TS_functions import shiftData, moving_window
 from sklearn.metrics import mean_squared_error
 import numpy as np
@@ -352,271 +353,432 @@ class DynamicStrategy():
     
 import numpy as np
 from copy import deepcopy
-
 class Stratify:
     """
-    A unified composite forecaster that wraps a base forecaster, a residual
-    forecaster and (optionally) a rectifier.  The concrete training / inference
-    strategy is chosen at runtime via ``rectifier.name``:
+    Stratify base--correction forecaster.
 
-    * ``'recmo'`` – *Recursive Multi‑Output* (vectorised block rectification).
-    * ``'dirrec'`` – *Direct‑Recursive Multi‑Output* (separate rectifier per
-      block).
-    * ``'dirmo'`` – *Direct Multi‑Output* (no rectification – residual model is
-      the final output).
+    Residuals are defined as
 
-    Parameters
-    ----------
-    base_forecaster : object
-        Model implementing ``fit(X, y)`` and ``predict(X)``.  Must expose a
-        ``window_size`` attribute.
-    residual_forecaster : object
-        Model of the forecast residuals implementing ``fit`` / ``predict``.
-    rectifier : object or None
-        Model implementing ``predict`` (and commonly ``fit``) with attributes:
-            * ``name``   – string in {"recmo", "dirrec", "dirmo"}
-            * ``MO_size`` – block length (only required for *recmo* / *dirrec*)
-            * ``function_family`` – prototype estimator to be deep‑copied for
-              each block (only required for *dirrec*).
-        For the *dirmo* strategy ``rectifier`` may be ``None``.
-    H_ahead : int
-        Forecast horizon.  For block approaches it must be an integer multiple
-        of ``rectifier.MO_size``.
+        e = beta - y,
+
+    where beta is the base forecast. The rectifier predicts e_hat, and the
+    corrected forecast is
+
+        y_hat = beta - e_hat.
+
+    For RecMO and DirRecMO rectifiers, recursive inputs remain in the original
+    forecast-value space. Each predicted residual block is combined with the
+    corresponding base forecast, and the resulting corrected forecast is used
+    when constructing subsequent rectifier inputs.
     """
 
     def __init__(self, base_forecaster, residual_forecaster, rectifier, H_ahead):
         self.base_forecaster = base_forecaster
         self.residual_forecaster = residual_forecaster
         self.rectifier = rectifier
-        # correct the horizon on the rectifier
-        self.rectifier.H_ahead = self.rectifier.MO_size
         self.H_ahead = H_ahead
 
-        # Normalise strategy label
         if rectifier is None or not hasattr(rectifier, "name"):
             raise ValueError("rectifier must have a .name attribute.")
 
         self.method = rectifier.name.lower()
 
         if self.method not in {"recmo", "dirrec", "dirmo"}:
-            raise ValueError(f"Unknown rectifier.name '{self.method}'. Expected 'recmo', 'dirrec' or 'dirmo'.")
+            raise ValueError(
+                f"Unknown rectifier.name '{self.method}'. "
+                "Expected 'recmo', 'dirrec' or 'dirmo'."
+            )
 
-
-        # Validate block settings for the two block‑based methods
         if self.method in {"recmo", "dirrec"}:
             self.s_2 = rectifier.MO_size
+
             if H_ahead % self.s_2:
-                raise ValueError(f"H_ahead ({H_ahead}) must be a multiple of rectifier.MO_size ({self.s_2}).")
+                raise ValueError(
+                    f"H_ahead ({H_ahead}) must be a multiple of "
+                    f"rectifier.MO_size ({self.s_2})."
+                )
+
             self.n_blocks = H_ahead // self.s_2
 
             if self.method == "dirrec":
-                # Prepare an independent rectifier per block using the provided prototype
-                self.block_models = [deepcopy(self.rectifier.function_family) for _ in range(self.n_blocks)]
+                self.block_models = [
+                    deepcopy(self.rectifier.function_family)
+                    for _ in range(self.n_blocks)
+                ]
         else:
-            self.s_2 = None  # not used
+            self.s_2 = None
             self.n_blocks = 1
 
-    # ---------------------------------------------------------------------
-    # Fitting
-    # ---------------------------------------------------------------------
-    def fit(self, X, y, save_location = ''):
-        """Fit all underlying components according to the chosen strategy."""
-        # 1. Base model -----------------------------------------------------
-        self.base_forecaster.fit(X, y, save_location = save_location) # base model can be loaded directly
-        base_preds = self.base_forecaster.predict(X)
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-        # 2. Residual model --------------------------------------------------
-        residual_str = self.base_forecaster.name + str(self.base_forecaster.MO_size) + '_residual_'
-        residuals = base_preds - y
-        self.residual_forecaster.fit(X, residuals, save_location = save_location + residual_str)
-        residual_preds = np.subtract(base_preds, self.residual_forecaster.predict(X))
+    @staticmethod
+    def _as_2d(values):
+        """Ensure predictions have shape (n_samples, n_outputs)."""
+        values = np.asarray(values)
+        if values.ndim == 1:
+            values = values.reshape(-1, 1)
+        return values
 
-        # 3. Rectifier‑specific training ------------------------------------
-        rectify_str = self.base_forecaster.name + str(self.base_forecaster.MO_size) + '_rectifier_' + self.method + f'{self.rectifier.MO_size}'
-        if self.method == "recmo":
-            self._fit_recmo(X, residuals, save_location = save_location + rectify_str)
-            # print(f"rectifier {self.rectifier.name} fitted, X shae {X.shape}, residuals shape {residuals.shape}")
-            final_train_error = np.mean((self.get_rectified_forecast(X) - y) ** 2)
+    def _fit_or_load_rectifier_model(
+        self,
+        model,
+        X,
+        target,
+        file,
+        family_name,
+    ):
+        """
+        Fit or load a rectifier model.
 
-        elif self.method == "dirrec":
-            self._fit_dirrec(X, residuals, base_preds, save_location = save_location + rectify_str)
-            final_train_error = np.mean((self.get_rectified_forecast(X) - y) ** 2)
+        This helper handles persistence only; recursive state construction is
+        defined separately by the corresponding strategy implementation.
+        """
+        target = self._as_2d(target)
+        fit_target = target.ravel() if target.shape[1] == 1 else target
 
-        else:  # dirmo – no rectifier
-            final_train_error = np.mean((residual_preds - y) ** 2)
+        neural_names = {"MLP", "RNN", "LSTM", "Transformer"}
 
-        # Diagnostics (quick and dirty – keep or remove to taste)
-        # print("--------------------------")
-        # print(f"Base train error:      {np.mean((base_preds - y) ** 2):.4f}")
-        # print(f"Residual train error:  {np.mean((residual_preds - y) ** 2):.4f}")
-        # if self.method != "dirmo":
-        #     print(f"Rectified train error: {final_train_error:.4f}")
-        # print("--------------------------")
-        return self
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    def _fit_recmo(self, X, residuals, save_location = ''):
-        """Fit single rectifier on the first block of residuals (RecMO)."""
-        # rectifier_targets = residuals[:, : self.s_2]
-        # self.rectifier.fit(X, rectifier_targets)
-        # try and load the model
-        try:
-            # iniitalise the weights
-            dys = residuals[:, : self.s_2]
-            self.model.fit(X, dys, init_only = True) if self.MO_size != 1 else self.model.fit(X, dys.ravel(), init_only = True)
-            
-            self.rectifier.model.load_state_dict(torch.load(f'{save_location}.pth'))
-            print(f'loaded pretrained {save_location}.pth')
-        except:
-            print(f'ERROR FINDING {save_location} - FITTING NEW MODEL')
-            # quit()
-            self.rectifier.model.fit(X, residuals[:, : self.s_2])
-            if len(save_location) > 0:
-                torch.save(self.rectifier.model.state_dict(), f'{save_location}.pth')
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    def _fit_dirrec(self, X, residuals, base_preds, save_location = ''):
-        """Fit an independent rectifier for each block (DirRecMO)."""
-        window_size = X.shape[1]
-        full_series = np.concatenate([X, base_preds], axis=1)  # (n, window + H)
-        # try and load the model
-        for block in range(self.n_blocks):
-            end = window_size + (block + 1) * self.s_2
-            rect_inputs = full_series[:, : end]
-            target_block = residuals[:, block * self.s_2 : (block + 1) * self.s_2]
-            file = f'{save_location}_id{block}'
+        if file:
             try:
-                if self.rectifier.function_family.name in ['MLP', 'RNN', 'LSTM', 'Transformer']:
-                    dys = target_block
-                    self.block_models[block].fit(rect_inputs, dys, init_only = True) if self.s_2 != 1 else self.block_models[block].fit(rect_inputs, dys.ravel(), init_only = True)
-                    self.block_models[block].load_state_dict(torch.load(f'{file}.pth'))
-                    print(f'loaded pretrained {file}.pth')
+                if family_name in neural_names:
+                    model.fit(X, fit_target, init_only=True)
+                    model.load_state_dict(torch.load(f"{file}.pth"))
+                    print(f"loaded pretrained {file}.pth")
+                    return model
+
+                elif family_name == "RF":
+                    model = load(f"{file}.joblib")
+                    print(f"loaded pretrained {file}.joblib")
+                    return model
+
+                elif family_name == "XGB":
+                    model.load_model(f"{file}.json")
+                    print(f"loaded pretrained {file}.json")
+                    return model
+
                 else:
-                    raise ValueError(f'No pretrained model found at {file}')
+                    raise ValueError(
+                        f"No loading rule for model family '{family_name}'."
+                    )
+
             except Exception as e:
                 print(e)
-                print(f'ERROR FINDING {file} - FITTING NEW MODEL')
-                # quit()
-                self.block_models[block].fit(rect_inputs, target_block)
-                if len(save_location) > 0:
-                    if self.rectifier.function_family.name in ['MLP', 'RNN', 'LSTM', 'Transformer']:
-                        torch.save(self.block_models[block].state_dict(), f'{file}.pth')
-            
-        
-        
+                print(f"ERROR FINDING {file} - FITTING NEW MODEL")
 
-    # ---------------------------------------------------------------------
+        model.fit(X, fit_target)
+
+        if file:
+            if family_name in neural_names:
+                torch.save(model.state_dict(), f"{file}.pth")
+
+            elif family_name == "RF":
+                dump(model, f"{file}.joblib", compress=("gzip", 3))
+
+            elif family_name == "XGB":
+                model.save_model(f"{file}.json")
+
+        return model
+
+    # ------------------------------------------------------------------
+    # Fitting
+    # ------------------------------------------------------------------
+
+    def fit(self, X, y, save_location=""):
+        """Fit the base forecaster and residual-correction construction."""
+        y = self._as_2d(y)
+
+        # 1. Fit the base forecasting strategy.
+        self.base_forecaster.fit(
+            X,
+            y,
+            save_location=save_location,
+        )
+
+        base_preds = self._as_2d(
+            self.base_forecaster.predict(X)
+        )
+
+        # 2. Construct residual targets:
+        #
+        #     e = beta - y
+        residuals = base_preds - y
+
+        residual_str = (
+            self.base_forecaster.name
+            + str(self.base_forecaster.MO_size)
+            + "_residual_"
+        )
+
+        self.residual_forecaster.fit(
+            X,
+            residuals,
+            save_location=save_location + residual_str,
+        )
+
+        # 3. Fit the selected rectifier strategy.
+        rectify_str = (
+            self.base_forecaster.name
+            + str(self.base_forecaster.MO_size)
+            + "_rectifier_"
+            + self.method
+            + str(self.rectifier.MO_size)
+        )
+
+        if self.method == "recmo":
+            self._fit_recmo(
+                X,
+                residuals,
+                save_location=save_location + rectify_str,
+            )
+
+        elif self.method == "dirrec":
+            self._fit_dirrec(
+                X,
+                residuals,
+                base_preds,
+                save_location=save_location + rectify_str,
+            )
+
+        # For DirMO, the residual forecaster fitted above directly supplies
+        # the correction over the complete forecast horizon.
+        return self
+
+    # ------------------------------------------------------------------
+    # RecMO rectifier fitting
+    # ------------------------------------------------------------------
+
+    def _fit_recmo(self, X, residuals, save_location=""):
+        """
+        Fit one s_2-output correction model on the first residual block.
+
+        At prediction time, the same model is applied recursively to
+        fixed-width windows containing previously corrected forecasts.
+        """
+        target_block = residuals[:, : self.s_2]
+
+        family_name = self.rectifier.function_family.name
+
+        self.rectifier.model = self._fit_or_load_rectifier_model(
+            model=self.rectifier.model,
+            X=X,
+            target=target_block,
+            file=save_location,
+            family_name=family_name,
+        )
+
+    # ------------------------------------------------------------------
+    # DirRecMO rectifier fitting
+    # ------------------------------------------------------------------
+
+    def _fit_dirrec(self, X, residuals, base_preds, save_location=""):
+        """
+        Sequentially fit the DirRecMO correction models.
+
+        Each block model predicts a residual from the accumulated forecast
+        state. The residual prediction is combined with the corresponding base
+        forecast, and the corrected block is appended to the state used by
+        subsequent models.
+        """
+        rect_inputs = np.asarray(X)
+
+        family_name = self.rectifier.function_family.name
+
+        for block in range(self.n_blocks):
+            start = block * self.s_2
+            stop = (block + 1) * self.s_2
+
+            target_block = residuals[:, start:stop]
+
+            file = f"{save_location}_id{block}"
+
+            self.block_models[block] = self._fit_or_load_rectifier_model(
+                model=self.block_models[block],
+                X=rect_inputs,
+                target=target_block,
+                file=file,
+                family_name=family_name,
+            )
+
+            predicted_error = self._as_2d(
+                self.block_models[block].predict(rect_inputs)
+            )
+
+            base_block = base_preds[:, start:stop]
+
+            # Convert the predicted residual to a corrected forecast.
+            corrected_block = base_block - predicted_error
+
+            # Append the corrected block to the state for later models.
+            rect_inputs = np.concatenate(
+                [rect_inputs, corrected_block],
+                axis=1,
+            )
+
+    # ------------------------------------------------------------------
     # Forecast helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+
     def get_base_forecast(self, X):
-        return self.base_forecaster.predict(X)
+        return self._as_2d(
+            self.base_forecaster.predict(X)
+        )
 
     def get_residual_forecast(self, X):
-        base_f = self.get_base_forecast(X)
-        res_f = self.residual_forecaster.predict(X)
-        return np.subtract(base_f, res_f)
+        """
+        Apply the separately fitted residual forecaster to the base forecast.
 
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        With e = beta - y, the corrected forecast is
+
+            y_hat = beta - e_hat.
+        """
+        base_f = self.get_base_forecast(X)
+
+        error_f = self._as_2d(
+            self.residual_forecaster.predict(X)
+        )
+
+        return base_f - error_f
+
     def get_rectified_forecast(self, X):
         if self.method == "dirmo":
-            # In direct multi‑output the rectified output is just the residual model
             return self.get_residual_forecast(X)
+
         elif self.method == "recmo":
             return self._rectified_recmo(X)
+
         else:  # dirrec
             return self._rectified_dirrec(X)
 
-    # .....................................................................
+    # ------------------------------------------------------------------
+    # RecMO rectifier rollout
+    # ------------------------------------------------------------------
+
     def _rectified_recmo(self, X):
+        """
+        Generate a closed-loop RecMO rectified forecast.
+
+        Each predicted residual block is combined with the corresponding base
+        forecast before the corrected block is inserted into the rolling
+        forecast state.
+        """
+        X = np.asarray(X)
+
         n_samples, window_size = X.shape
         base_f = self.get_base_forecast(X)
-        full_series = np.concatenate([X, base_f], axis=1)
 
-        # Build all rectifier inputs in one batch (vectorised formulation)
-        rect_inputs = np.stack(
-            [full_series[:, b * self.s_2 : window_size + b * self.s_2] for b in range(self.n_blocks)],
+        # Rolling state: observed history followed by future forecast slots.
+        rollout_state = np.concatenate(
+            [
+                X,
+                np.zeros((n_samples, self.H_ahead)),
+            ],
             axis=1,
-        )  # (n, blocks, window)
-        batch_inputs = rect_inputs.reshape(-1, window_size)
-        batch_outputs = self.rectifier.model.predict(batch_inputs)  # (n*blocks, s2)
-        rect_outputs = batch_outputs.reshape(n_samples, self.n_blocks, self.s_2)
-        
-
-        base_blocks = base_f.reshape(n_samples, self.n_blocks, self.s_2)
-        corrected_blocks = base_blocks - rect_outputs
-        return corrected_blocks.reshape(n_samples, self.H_ahead)
-
-    # .....................................................................
-    def _rectified_dirrec(self, X):
-        n_samples, window_size = X.shape
-        base_f = self.get_base_forecast(X)
-        full_series = np.concatenate([X, base_f], axis=1)
-        rectified = np.zeros_like(base_f)
+        )
 
         for block in range(self.n_blocks):
-            end = window_size + (block + 1) * self.s_2
-            rect_inputs = full_series[:, : end]
-            block_residual_pred = self.block_models[block].predict(rect_inputs)
-            rectified[:, block * self.s_2 : (block + 1) * self.s_2] = block_residual_pred
+            start = block * self.s_2
+            stop = (block + 1) * self.s_2
 
-        return np.subtract(base_f, rectified)
+            # Fixed-width RecMO input window.
+            input_window = rollout_state[
+                :,
+                start : start + window_size,
+            ]
 
-    # ---------------------------------------------------------------------
-    # Public prediction interface
-    # ---------------------------------------------------------------------
-    def predict(self, X, decompose = False):
+            predicted_error = self._as_2d(
+                self.rectifier.model.predict(input_window)
+            )
+
+            base_block = base_f[:, start:stop]
+
+            # Convert the predicted residual to a corrected forecast.
+            corrected_block = base_block - predicted_error
+
+            # Insert the corrected block into the rolling forecast state.
+            rollout_state[
+                :,
+                window_size + start : window_size + stop,
+            ] = corrected_block
+
+        return rollout_state[:, -self.H_ahead:]
+
+    # ------------------------------------------------------------------
+    # DirRecMO rectifier rollout
+    # ------------------------------------------------------------------
+
+    def _rectified_dirrec(self, X):
+        """
+        Generate a closed-loop DirRecMO rectified forecast.
+
+        Each block model predicts a residual from the current accumulated
+        forecast state. The corrected forecast block is appended before the
+        next block model is evaluated.
+        """
+        X = np.asarray(X)
+
+        base_f = self.get_base_forecast(X)
+
+        rectified = np.zeros_like(base_f)
+
+        # The first model receives only the observed history.
+        rect_inputs = X
+
+        for block in range(self.n_blocks):
+            start = block * self.s_2
+            stop = (block + 1) * self.s_2
+
+            predicted_error = self._as_2d(
+                self.block_models[block].predict(rect_inputs)
+            )
+
+            base_block = base_f[:, start:stop]
+
+            # Convert the predicted residual to a corrected forecast.
+            corrected_block = base_block - predicted_error
+
+            rectified[:, start:stop] = corrected_block
+
+            # Append the corrected block for use by subsequent models.
+            rect_inputs = np.concatenate(
+                [rect_inputs, corrected_block],
+                axis=1,
+            )
+
+        return rectified
+
+    # ------------------------------------------------------------------
+    #  prediction interface
+    # ------------------------------------------------------------------
+
+    def predict(self, X, decompose=False):
         if not decompose:
             return self.get_rectified_forecast(X)
-        else:
-            residual = self.get_residual_forecast(X)
-            rectified = residual if self.method == "dirmo" else self.get_rectified_forecast(X)
-            return {
-                "base": self.get_base_forecast(X),
-                "residual": residual,
-                "rectified": rectified,
-            }
 
-    # ---------------------------------------------------------------------
+        residual_corrected = self.get_residual_forecast(X)
+
+        rectified = (
+            residual_corrected
+            if self.method == "dirmo"
+            else self.get_rectified_forecast(X)
+        )
+
+        return {
+            "base": self.get_base_forecast(X),
+            "residual": residual_corrected,
+            "rectified": rectified,
+        }
+
+    # ------------------------------------------------------------------
+
     def __repr__(self):
         method = self.method.upper()
+
         return (
             f"Stratify(method={method}, H_ahead={self.H_ahead}, "
             f"base={self.base_forecaster.__class__.__name__}, "
             f"residual={self.residual_forecaster.__class__.__name__}, "
-            f"rectifier={getattr(self.rectifier, '__class__', type(None)).__name__})"
+            f"rectifier="
+            f"{getattr(self.rectifier, '__class__', type(None)).__name__})"
         )
-
-
-# _____________________________________________________________________ 
-# Legacy code
-# _____________________________________________________________________
-class STRATIFY():
-
-    def __init__(self, base_forcaster, residual_forecaster):
-        self.base_forcaster = base_forcaster
-        self.residual_forecaster = residual_forecaster
-        assert False, 'Updated to use Stratify class'
-        
-    def fit(self, windowed_data, ys, save_location = ''):
-        
-        xs, ys = windowed_data, ys
-        try:
-            base_preds = self.base_forcaster.predict(xs)
-        except:
-            print('failiure in base, fit base first and use .predict class method') 
-            base_preds = self.base_forcaster.predict(xs)
-        
-        errors = np.subtract(base_preds, ys)
-        
-        self.residual_forecaster.fit(xs, errors, save_location = save_location)
-                        
-    def predict(self, windowed_data):
-        base_preds = self.base_forcaster.predict(windowed_data) 
-        residual_preds = self.residual_forecaster.predict(windowed_data)
-        preds = base_preds - residual_preds
-        return preds
-
-    def evaluate(self, windowed_data, metric = mean_squared_error):
-        xs, ys = shiftData(windowed_data[:-1], self.H_ahead)
-        pred_ys = self.predict(xs)
-        return np.array([metric(pred_ys[i], ys[i]) for i in range(len(pred_ys))])
